@@ -283,9 +283,27 @@ public final class CitizenSelfFeedingService {
             ate = true;
         }
         if (ate) {
-            manager.syncEntity(entity);
+            beginBackpackEating(level, manager, citizen, entity);
         }
         return ate;
+    }
+
+    /** beginBackpackEating：背包进食成功后创建短暂 EATING 阶段，阻塞工作服务以展示进食视觉。 */
+    private static void beginBackpackEating(ServerLevel level, CitizenManager manager, CitizenData citizen, CitizenEntity entity) {
+        long gameTime = level.getGameTime();
+        FeedingRuntime feeding = new FeedingRuntime(
+                restorableStatusLabel(citizen.statusLabel()),
+                restorableWorkNeedDetail(citizen.workNeedDetail()));
+        feeding.phase = Phase.EATING;
+        feeding.nextTick = gameTime + EAT_VISUAL_TICKS;
+        feeding.overlayStatusLabel = EATING_FOOD_STATUS;
+        runtime(level).active.put(citizen.uuid(), feeding);
+        citizen.setStatusLabel(EATING_FOOD_STATUS);
+        citizen.setWorkNeedDetail("");
+        manager.saveCitizenNow(citizen.uuid());
+        level.playSound(null, entity.blockPosition(), SoundEvents.GENERIC_EAT, SoundSource.NEUTRAL, 0.8F, 1.0F);
+        entity.swing(InteractionHand.MAIN_HAND);
+        manager.syncEntity(entity);
     }
 
     /** buyExtraForBackpack：购买成功后额外多买若干份存入背包，供下次饥饿时直接取用。 */
