@@ -24,6 +24,8 @@ final class ActiveNavigation {
     private static final double CLIMB_VERTICAL_SPEED_FACTOR = 0.22D;
     private static final double CLIMB_EXIT_DETACH_HORIZONTAL_SPEED = 0.09D;
     private static final double CLIMB_EXIT_DROP_SPEED = -0.12D;
+    private static final double SWIM_UPWARD_SPEED = 0.12D;
+    private static final double SWIM_UPWARD_FACTOR = 0.18D;
     private static final double CORNER_ARRIVAL_DISTANCE = 0.30D;
     private static final double SEGMENT_LOOKAHEAD_BLOCKS = 1.15D;
     private static final double CORNER_LOOKAHEAD_BLOCKS = 0.55D;
@@ -164,6 +166,7 @@ final class ActiveNavigation {
         }
         citizen.getMoveControl().setWantedPosition(commandTarget.x, commandTarget.y, commandTarget.z, speed);
         applyClimbMotion(citizen, commandTarget, commandMode);
+        applySwimAssist(citizen, commandTarget, commandMode);
         if (shouldTriggerJump(citizen, waypointIndex, waypoint)) {
             citizen.triggerPathJump();
             jumpTriggered = true;
@@ -312,8 +315,30 @@ final class ActiveNavigation {
             return;
         }
         Vec3 motion = citizen.getDeltaMovement();
-        double verticalSpeed = Math.max(-CLIMB_VERTICAL_SPEED, Math.min(CLIMB_VERTICAL_SPEED, dy * CLIMB_VERTICAL_SPEED_FACTOR));
+        double verticalSpeed = Math.clamp(dy * CLIMB_VERTICAL_SPEED_FACTOR, -CLIMB_VERTICAL_SPEED, CLIMB_VERTICAL_SPEED);
         citizen.setDeltaMovement(motion.x, verticalSpeed, motion.z);
+        citizen.fallDistance = 0.0F;
+    }
+
+    /**
+     * applySwimAssist：NPC 在水中时 vanilla MoveControl 无法提供足够的上浮力，
+     * 需要像 applyClimbMotion 一样直接驱动竖直分量，帮助 NPC 游出水面或爬上岸。
+     */
+    private void applySwimAssist(CitizenEntity citizen, Vec3 commandTarget, MovementMode commandMode) {
+        if (!citizen.isInWater()) {
+            return;
+        }
+        // 只在上浮/出水阶段施加辅助：目标高于当前或正处于 SWIM 模式
+        double dy = commandTarget.y - citizen.getY();
+        if (dy <= 0.05D && commandMode != MovementMode.SWIM) {
+            return;
+        }
+        Vec3 motion = citizen.getDeltaMovement();
+        double verticalSpeed = Math.clamp(dy * SWIM_UPWARD_FACTOR, -SWIM_UPWARD_SPEED, SWIM_UPWARD_SPEED);
+        // 仅当辅助力大于当前下落速度时才覆盖，避免打断已有的向上动量
+        if (verticalSpeed > motion.y) {
+            citizen.setDeltaMovement(motion.x, verticalSpeed, motion.z);
+        }
         citizen.fallDistance = 0.0F;
     }
 

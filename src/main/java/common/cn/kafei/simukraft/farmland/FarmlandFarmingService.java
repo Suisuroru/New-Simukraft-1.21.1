@@ -33,6 +33,7 @@ import net.minecraft.world.phys.Vec3;
 
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -45,7 +46,7 @@ import java.util.concurrent.ConcurrentMap;
 public final class FarmlandFarmingService {
     private static final ConcurrentMap<String, LevelRuntime> RUNTIMES = new ConcurrentHashMap<>();
     private static final long IDLE_INTERVAL_TICKS = 40L;
-    private static final long MOVE_INTERVAL_TICKS = 8L;
+    private static final long MOVE_SAFETY_TIMEOUT_TICKS = 60L;
     private static final String STATUS_MISSING_CHEST = "gui.simukraft.farmland.status.missing_chest";
     private static final String STATUS_MISSING_SEED = "gui.simukraft.farmland.status.missing_seed";
     private static final String STATUS_WAITING_GROWTH = "gui.simukraft.farmland.status.waiting_growth";
@@ -150,8 +151,7 @@ public final class FarmlandFarmingService {
         setFarmerStatus(level, farmer, boxRuntime, farmerStatusLabel(level, target.phase().translationKey(), data.crop()), CitizenWorkStatus.WORKING, target.phase().id());
         boxRuntime.setVisual(FarmlandFarmerVisualService.toolFor(data.crop(), target.phase()), false);
         FarmlandFarmerVisualService.apply(farmerEntity, boxRuntime.visualTool, boxRuntime.visualActive);
-        if (!isCloseEnoughToWork(level, boxPos, farmer, farmerEntity, target)) {
-            boxRuntime.nextActionTick = gameTime + MOVE_INTERVAL_TICKS;
+        if (!isCloseEnoughToWork(level, boxPos, farmer, farmerEntity, target, boxRuntime, gameTime)) {
             return;
         }
 
@@ -168,6 +168,21 @@ public final class FarmlandFarmingService {
             clearActiveTarget(boxRuntime);
             boxRuntime.nextActionTick = gameTime + 1L;
         }
+    }
+
+    // requestMoveWithArrival：注册一次性到达回调后发起导航，避免轮询。
+    // 农民到达时由事件驱动唤醒 BoxRuntime；MOVE_SAFETY_TIMEOUT_TICKS 作为兑底超时，防止监听器永不触发。
+    private static void requestMoveWithArrival(ServerLevel level, CitizenData farmer, BoxRuntime boxRuntime, Vec3 anchor, long gameTime) {
+        UUID farmerId = farmer.uuid();
+        if (!boxRuntime.movePending) {
+            boxRuntime.movePending = true;
+            CitizenNavigationService.onArrival(level, farmerId, id -> {
+                boxRuntime.movePending = false;
+                boxRuntime.nextActionTick = level.getGameTime() + 1L;
+            });
+        }
+        CitizenNavigationService.requestMove(level, farmerId, anchor, MovementIntent.WORK);
+        boxRuntime.nextActionTick = gameTime + MOVE_SAFETY_TIMEOUT_TICKS;
     }
 
     private static FarmlandWorkTarget resolveTarget(ServerLevel level, FarmlandBoxData data, List<BlockPos> chestPositions, BoxRuntime boxRuntime) {
@@ -366,13 +381,15 @@ public final class FarmlandFarmingService {
         }
     }
 
-    private static boolean isCloseEnoughToWork(ServerLevel level, BlockPos boxPos, CitizenData farmer, CitizenEntity farmerEntity, FarmlandWorkTarget target) {
+    private static boolean isCloseEnoughToWork(ServerLevel level, BlockPos boxPos, CitizenData farmer, CitizenEntity farmerEntity, FarmlandWorkTarget target, BoxRuntime boxRuntime, long gameTime) {
         Vec3 targetCenter = Vec3.atCenterOf(target.cropPos());
         if (farmerEntity.position().distanceToSqr(targetCenter) <= FarmlandWorkGeometry.ACTION_REACH * FarmlandWorkGeometry.ACTION_REACH) {
+            boxRuntime.movePending = false;
+            CitizenNavigationService.removeOnArrival(level, farmer.uuid());
             return true;
         }
         Vec3 anchor = FarmlandWorkGeometry.workAnchorFor(level, boxPos, target.cropPos());
-        CitizenNavigationService.requestMove(level, farmer.uuid(), anchor, MovementIntent.WORK);
+        requestMoveWithArrival(level, farmer, boxRuntime, anchor, gameTime);
         return false;
     }
 
@@ -525,6 +542,7 @@ public final class FarmlandFarmingService {
 
     private static void clearActiveTarget(BoxRuntime boxRuntime) {
         boxRuntime.activeTarget = null;
+        boxRuntime.movePending = false;
     }
 
     private static LevelRuntime runtime(ServerLevel level) {
@@ -546,6 +564,7 @@ public final class FarmlandFarmingService {
         private String lastStatusLabel = "";
         private ItemStack visualTool = ItemStack.EMPTY;
         private boolean visualActive;
+        private volatile boolean movePending;
 
         private int cursor(FarmlandWorkPhase phase) {
             return cursors[phase.ordinal()];

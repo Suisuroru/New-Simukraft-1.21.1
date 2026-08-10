@@ -30,6 +30,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 @SuppressWarnings("Null")
 public final class CitizenNavigationService {
@@ -174,6 +175,27 @@ public final class CitizenNavigationService {
             citizen.getMoveControl().setWantedPosition(citizen.getX(), citizen.getY(), citizen.getZ(), 0.0D);
         }
         PathCrowdCoordinator.clear(level, citizenId);
+    }
+
+    /**
+     * onArrival：注册一次性回调，当指定 NPC 的导航完成（到达、传送或清理）时触发。
+     * 如果同一 citizenId 已注册过监听，旧监听会被替换。回调在主线程执行，应保持轻量。
+     */
+    public static void onArrival(ServerLevel level, UUID citizenId, Consumer<UUID> listener) {
+        if (level == null || citizenId == null || listener == null) {
+            return;
+        }
+        LevelRuntime runtime = runtime(level);
+        runtime.arrivalListeners.put(citizenId, listener);
+    }
+
+    /** removeOnArrival：移除之前注册的到达回调。 */
+    public static void removeOnArrival(ServerLevel level, UUID citizenId) {
+        if (level == null || citizenId == null) {
+            return;
+        }
+        LevelRuntime runtime = runtime(level);
+        runtime.arrivalListeners.remove(citizenId);
     }
 
     public static boolean isNavigating(ServerLevel level, UUID citizenId) {
@@ -334,6 +356,14 @@ public final class CitizenNavigationService {
         executorSize = 0;
     }
 
+    /** fireArrivalListeners：触发并移除一次性到达回调，由 tickActivePaths 在导航结束时调用。 */
+    private static void fireArrivalListeners(LevelRuntime runtime, UUID citizenId) {
+        Consumer<UUID> listener = runtime.arrivalListeners.remove(citizenId);
+        if (listener != null) {
+            listener.accept(citizenId);
+        }
+    }
+
     private static void processQueuedRequests(ServerLevel level, LevelRuntime runtime) {
         int processed = 0;
         int budget = Math.max(0, ServerConfig.pathMaxNewRequestsPerTick());
@@ -439,11 +469,13 @@ public final class CitizenNavigationService {
             Map.Entry<UUID, ActiveNavigation> entry = iterator.next();
             CitizenEntity citizen = CitizenTeleportService.findCitizenEntity(level, entry.getKey());
             if (citizen == null) {
+                fireArrivalListeners(runtime, entry.getKey());
                 iterator.remove();
                 continue;
             }
             if (citizen.isSleeping()) {
                 clearRuntimeNavigation(level, runtime, entry.getKey(), citizen, false);
+                fireArrivalListeners(runtime, entry.getKey());
                 iterator.remove();
                 continue;
             }
@@ -468,6 +500,7 @@ public final class CitizenNavigationService {
                     runtime.latestRequests.remove(entry.getKey());
                     runtime.cooldowns.remove(entry.getKey());
                     runtime.blockedSince.remove(entry.getKey());
+                    fireArrivalListeners(runtime, entry.getKey());
                     continue;
                 }
                 runtime.cooldowns.put(entry.getKey(), level.getGameTime() + 20L);
@@ -478,6 +511,7 @@ public final class CitizenNavigationService {
                 }
             } else {
                 runtime.blockedSince.remove(entry.getKey());
+                fireArrivalListeners(runtime, entry.getKey());
             }
         }
     }
@@ -591,6 +625,7 @@ public final class CitizenNavigationService {
         private final Map<UUID, Long> cooldowns = new java.util.HashMap<>();
         private final Map<UUID, Long> blockedSince = new java.util.HashMap<>();
         private final Map<Long, CitizenDoorService.OpenedDoor> openedDoors = new java.util.HashMap<>();
+        private final ConcurrentMap<UUID, Consumer<UUID>> arrivalListeners = new ConcurrentHashMap<>();
         private final PathResultCache pathCache = new PathResultCache();
         private final PathSnapshotCache snapshotCache = new PathSnapshotCache();
         private long loadedCitizenCountTick = Long.MIN_VALUE;
