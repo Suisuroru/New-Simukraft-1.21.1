@@ -1,5 +1,7 @@
 package common.cn.kafei.simukraft.citizen;
 
+import common.cn.kafei.simukraft.citizen.family.FamilyData;
+import common.cn.kafei.simukraft.citizen.family.FamilyManager;
 import common.cn.kafei.simukraft.commercial.CommercialFoodMarketService;
 import common.cn.kafei.simukraft.city.poi.CityPoiManager;
 import common.cn.kafei.simukraft.entity.CitizenEntity;
@@ -16,10 +18,7 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.Vec3;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -29,10 +28,12 @@ public final class CitizenSelfFeedingService {
     public static final String BUYING_FOOD_STATUS = "gui.npc.status.buying_food";
     public static final String EATING_FOOD_STATUS = "gui.npc.status.eating_food";
     public static final String TOO_HUNGRY_STRIKE_STATUS = "gui.npc.status.too_hungry_on_strike";
+    public static final String DELIVERING_FOOD_STATUS = "gui.npc.status.delivering_food";
     private static final String FOOD_NEED_PREFIX = "food:";
     private static final double START_HUNGER_THRESHOLD = 5.0D;
     private static final double FULL_HUNGER = CitizenEntity.DEFAULT_HUNGER;
     private static final double ARRIVAL_DISTANCE_SQR = 16.0D;
+    private static final double DELIVERY_DISTANCE_SQR = 4.0D;
     private static final int BACKPACK_BUY_MIN = 5;  // 购买时额外存入背包的最小数量
     private static final int BACKPACK_BUY_MAX = 10; // 购买时额外存入背包的最大数量
     private static final long SERVICE_INTERVAL_TICKS = 20L;
@@ -65,8 +66,23 @@ public final class CitizenSelfFeedingService {
             }
             clearStaleFoodStatus(level, manager, citizen);
             // 背包有存粮时直接进食，不必出门购买
-            if (!citizen.dead() && !citizen.child()) {
+            if (!citizen.dead()) {
                 CitizenEntity idleEntity = CitizenTeleportService.findCitizenEntity(level, citizen.uuid());
+                if (citizen.age() < 12) {
+                    FamilyData family = FamilyManager.get(level).getFamilyByCitizen(citizen.uuid()).orElse(null);
+                    CitizenData familyHead = resolveFamilyHead(family, manager);
+                    if (familyHead != null
+                            && idleEntity != null
+                            && idleEntity.getHungerValue() < START_HUNGER_THRESHOLD
+                            && parentHasFood(level, familyHead, idleEntity)
+                            && !isSelfFeeding(level, familyHead.uuid())) {
+                        requestParentFoodDelivery(level, manager, familyHead, citizen, idleEntity, gameTime);
+                        continue;
+                    }
+                    if (familyHead == null) {
+                        citizen.forceMarkCouldBuyFood = true;
+                    }
+                }
                 if (idleEntity != null && idleEntity.getHungerValue() < START_HUNGER_THRESHOLD
                         && tryEatFromBackpack(level, manager, citizen, idleEntity)) {
                     continue;
@@ -76,6 +92,21 @@ public final class CitizenSelfFeedingService {
                 start(level, manager, citizen, runtime, gameTime);
             }
         }
+    }
+
+    private static CitizenData resolveFamilyHead(FamilyData family, CitizenManager manager) {
+        if (family == null) return null;
+        UUID husbandId = family.husbandId();
+        if (husbandId != null) {
+            CitizenData husband = manager.getCitizen(husbandId).orElse(null);
+            if (husband != null && !husband.dead()) return husband;
+        }
+        UUID wifeId = family.wifeId();
+        if (wifeId != null) {
+            CitizenData wife = manager.getCitizen(wifeId).orElse(null);
+            if (wife != null && !wife.dead()) return wife;
+        }
+        return null;
     }
 
     /** isSelfFeeding: 判断指定 NPC 是否正被买饭流程抢占。 */
@@ -115,7 +146,10 @@ public final class CitizenSelfFeedingService {
     }
 
     private static boolean shouldStart(ServerLevel level, CitizenData citizen, long gameTime, LevelRuntime runtime) {
-        if (citizen == null || citizen.dead() || citizen.child() || citizen.cityId() == null) {
+        if (citizen == null || citizen.dead() || citizen.cityId() == null) {
+            return false;
+        }
+        if (citizen.age() < 12 && !citizen.forceMarkCouldBuyFood) {
             return false;
         }
         if (MedicalMealService.isDoctorMealRunActive(level, citizen.uuid())) {
@@ -125,14 +159,15 @@ public final class CitizenSelfFeedingService {
             return false;
         }
         CitizenEntity entity = CitizenTeleportService.findCitizenEntity(level, citizen.uuid());
-        if (entity == null || entity.getHungerValue() > START_HUNGER_THRESHOLD) {
+        if (entity == null) {
+            return false;
+        }
+        boolean parentProxy = citizen.forceMarkCouldBuyFood || hasHungryChild(level, citizen);
+        if (!parentProxy && entity.getHungerValue() > START_HUNGER_THRESHOLD) {
             return false;
         }
         Long cooldown = runtime.cooldowns.get(citizen.uuid());
-        if (cooldown != null && cooldown > gameTime) {
-            return false;
-        }
-        return true;
+        return cooldown == null || cooldown <= gameTime;
     }
 
     private static void start(ServerLevel level, CitizenManager manager, CitizenData citizen, LevelRuntime runtime, long gameTime) {
@@ -170,9 +205,11 @@ public final class CitizenSelfFeedingService {
             case TRAVEL -> tickTravel(level, manager, citizen, entity, feeding, gameTime);
             case EATING -> {
                 if (gameTime >= feeding.nextTick) {
-                    finish(level, manager, citizen, feeding, true);
+                    // 背包进食不需要导航回工位或离开商店，原地恢复即可
+                    finish(level, manager, citizen, feeding, !feeding.fromBackpack);
                 }
             }
+            case DELIVERING -> tickParentDeliver(level, manager, citizen, entity, feeding, gameTime);
         }
     }
 
@@ -208,6 +245,29 @@ public final class CitizenSelfFeedingService {
         }
         if (gameTime >= feeding.nextTick) {
             requestMove(level, citizen.uuid(), feeding.plan);
+            feeding.nextTick = gameTime + MOVE_RETRY_TICKS;
+        }
+    }
+
+    private static void tickParentDeliver(ServerLevel level, CitizenManager manager, CitizenData parent,
+                                          CitizenEntity parentEntity, FeedingRuntime feeding, long gameTime) {
+        if (feeding.childId == null) {
+            finish(level, manager, parent, feeding, true);
+            return;
+        }
+        CitizenEntity childEntity = CitizenTeleportService.findCitizenEntity(level, feeding.childId);
+        if (childEntity == null || childEntity.getHungerValue() >= FULL_HUNGER) {
+            finish(level, manager, parent, feeding, true);
+            return;
+        }
+        if (parentEntity.position().distanceToSqr(childEntity.position()) <= DELIVERY_DISTANCE_SQR) {
+            transferFoodFromParentToChild(level, parent, childEntity);
+            finish(level, manager, parent, feeding, true);
+            return;
+        }
+        if (gameTime >= feeding.nextTick) {
+            CitizenNavigationService.requestMove(level, parent.uuid(),
+                    childEntity.position(), MovementIntent.SELF_FEEDING);
             feeding.nextTick = gameTime + MOVE_RETRY_TICKS;
         }
     }
@@ -283,9 +343,28 @@ public final class CitizenSelfFeedingService {
             ate = true;
         }
         if (ate) {
-            manager.syncEntity(entity);
+            beginBackpackEating(level, manager, citizen, entity);
         }
         return ate;
+    }
+
+    /** beginBackpackEating：背包进食成功后创建短暂 EATING 阶段，阻塞工作服务以展示进食视觉。 */
+    private static void beginBackpackEating(ServerLevel level, CitizenManager manager, CitizenData citizen, CitizenEntity entity) {
+        long gameTime = level.getGameTime();
+        FeedingRuntime feeding = new FeedingRuntime(
+                restorableStatusLabel(citizen.statusLabel()),
+                restorableWorkNeedDetail(citizen.workNeedDetail()));
+        feeding.phase = Phase.EATING;
+        feeding.fromBackpack = true;
+        feeding.nextTick = gameTime + EAT_VISUAL_TICKS;
+        feeding.overlayStatusLabel = EATING_FOOD_STATUS;
+        runtime(level).active.put(citizen.uuid(), feeding);
+        citizen.setStatusLabel(EATING_FOOD_STATUS);
+        citizen.setWorkNeedDetail("");
+        manager.saveCitizenNow(citizen.uuid());
+        level.playSound(null, entity.blockPosition(), SoundEvents.GENERIC_EAT, SoundSource.NEUTRAL, 0.8F, 1.0F);
+        entity.swing(InteractionHand.MAIN_HAND);
+        manager.syncEntity(entity);
     }
 
     /** buyExtraForBackpack：购买成功后额外多买若干份存入背包，供下次饥饿时直接取用。 */
@@ -300,6 +379,67 @@ public final class CitizenSelfFeedingService {
         }
         if (!extras.isEmpty()) {
             inventory.insertBackpackAll(extras);
+        }
+    }
+
+    private static boolean hasHungryChild(ServerLevel level, CitizenData parent) {
+        FamilyData family = FamilyManager.get(level).getFamilyByCitizen(parent.uuid()).orElse(null);
+        if (family == null) return false;
+        CitizenManager manager = CitizenManager.get(level);
+        for (UUID childId : family.childIds()) {
+            CitizenData child = manager.getCitizen(childId).orElse(null);
+            if (child == null || child.dead() || child.age() >= 12) continue;
+            CitizenEntity childEntity = CitizenTeleportService.findCitizenEntity(level, childId);
+            if (childEntity != null && childEntity.getHungerValue() < START_HUNGER_THRESHOLD) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean parentHasFood(ServerLevel level, CitizenData parent, CitizenEntity childEntity) {
+        CitizenEntity parentEntity = CitizenTeleportService.findCitizenEntity(level, parent.uuid());
+        if (parentEntity == null) return false;
+        CitizenInventory inv = parentEntity.getCitizenInventory();
+        for (int i = 0; i < CitizenInventory.BACKPACK_SIZE; i++) {
+            if (CitizenFoodConsumptionService.isFoodStack(childEntity, inv.getItem(i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void requestParentFoodDelivery(ServerLevel level, CitizenManager manager,
+                                                   CitizenData parent, CitizenData child,
+                                                   CitizenEntity childEntity, long gameTime) {
+        FeedingRuntime feeding = new FeedingRuntime(
+                restorableStatusLabel(parent.statusLabel()),
+                restorableWorkNeedDetail(parent.workNeedDetail()));
+        feeding.phase = Phase.DELIVERING;
+        feeding.childId = child.uuid();
+        feeding.nextTick = gameTime + MOVE_RETRY_TICKS;
+        feeding.overlayStatusLabel = DELIVERING_FOOD_STATUS;
+        runtime(level).active.put(parent.uuid(), feeding);
+        parent.setStatusLabel(DELIVERING_FOOD_STATUS);
+        parent.setWorkNeedDetail("");
+        manager.saveCitizenNow(parent.uuid());
+        CitizenNavigationService.requestMove(level, parent.uuid(),
+                childEntity.position(), MovementIntent.SELF_FEEDING);
+    }
+
+    private static void transferFoodFromParentToChild(ServerLevel level, CitizenData parent, CitizenEntity childEntity) {
+        CitizenEntity parentEntity = CitizenTeleportService.findCitizenEntity(level, parent.uuid());
+        if (parentEntity == null) {
+            return;
+        }
+        var extracted = parentEntity.getCitizenInventory().extractFirstBackpack(
+                stack -> CitizenFoodConsumptionService.isFoodStack(childEntity, stack));
+        if (extracted.isEmpty()) {
+            return;
+        }
+        ItemStack food = extracted.get();
+        if (!childEntity.getCitizenInventory().insertBackpackAll(List.of(food))) {
+            parentEntity.getCitizenInventory().insertBackpackAll(List.of(food));
         }
     }
 
@@ -413,7 +553,8 @@ public final class CitizenSelfFeedingService {
     private enum Phase {
         TRAVEL,
         STRIKE,
-        EATING
+        EATING,
+        DELIVERING
     }
 
     private static final class LevelRuntime {
@@ -427,6 +568,8 @@ public final class CitizenSelfFeedingService {
         private Phase phase = Phase.STRIKE;
         private CommercialFoodMarketService.PurchasePlan plan;
         private volatile String overlayStatusLabel = "";
+        private boolean fromBackpack;
+        private UUID childId;
         private long nextTick;
 
         private FeedingRuntime(String previousStatusLabel, String previousWorkNeedDetail) {
