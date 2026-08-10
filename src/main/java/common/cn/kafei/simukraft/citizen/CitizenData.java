@@ -48,6 +48,7 @@ public final class CitizenData {
     private UUID reservedBabyBedPoiId; // 怀孕时预约给婴儿的住宅床位
     private long lastAgeGrowthDay = -1L;
     private final MedicalPatientData medical = new MedicalPatientData();
+    public boolean forceMarkCouldBuyFood = false;
 
     public CitizenData(UUID uuid) {
         this.uuid = Objects.requireNonNull(uuid, "uuid");
