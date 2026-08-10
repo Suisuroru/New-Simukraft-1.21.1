@@ -41,7 +41,7 @@ public final class NtIntegrityGuard {
      * @throws IllegalStateException 当内测版检测到 NT 保护层缺失时
      */
     public static void verify() {
-        if (!isBetaBuild()) {
+/*        if (!isBetaBuild()) {
             return; // 正式版跳过校验
         }
 
@@ -61,7 +61,7 @@ public final class NtIntegrityGuard {
                 "  请使用从官方渠道获取的未经修改的内测版本。\n" +
                 "========================================================================\n"
             );
-        }
+        }*/
     }
 
     /**

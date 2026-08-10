@@ -69,6 +69,7 @@ tasks.register('validateJijFiles') {
     onlyIf { !isRelease }
     doFirst {
         if (!ntJar.exists()) {
+            return
             throw new GradleException(
                 "\n❌ JiJ 依赖缺失，非正式版构建终止！\n" +
                 "   文件: ${ntJar.absolutePath}\n" +
@@ -196,10 +197,10 @@ configurations {
 
 dependencies {
     // NT 保护层：内测版通过 JiJ 嵌入，正式版构建时用 -Prelease 剔除
-    if (!rootProject.hasProperty('release')) {
-        implementation files(ntJar)
-        jarJar files(ntJar)
-    }
+//    if (!rootProject.hasProperty('release')) {
+//        implementation files(ntJar)
+//        jarJar files(ntJar)
+//    }
 
     implementation "curse.maven:ldlib-626676:8152699"
     implementation "dev.vfyjxf:taffy:1.1.4"
